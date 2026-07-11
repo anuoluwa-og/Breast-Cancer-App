@@ -88,6 +88,9 @@ def parse_args():
     parser.add_argument('--d_state', default=16, type=int,
                         help='KMPUNet Mamba branch SSM state dimension')    
     
+    parser.add_argument('--resume_from', default=None, type=str,
+                    help='path to checkpoint_latest.pth to resume training from')
+    
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
     parser.add_argument('--input_channels', default=3, type=int,
                         help='input channels')
@@ -360,10 +363,28 @@ def main():
         )
     else:
         raise NotImplementedError
+    
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    log = OrderedDict([
+        ('epoch', []),
+        ('lr', []),
+        ('loss', []),
+        ('iou', []),
+    ])
+    if config['resume_from']:
+        print(f"=> resuming from checkpoint: {config['resume_from']}")
+        checkpoint = torch.load(config['resume_from'], map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        log = checkpoint.get('log', log)
+        print(f"=> resuming at epoch {start_epoch}/{config['epochs']}")
 
     if config['scheduler'] == 'CosineAnnealingLR':
         scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config['epochs'], eta_min=config['min_lr']
+            optimizer, T_max=config['epochs'], eta_min=config['min_lr'],
+            last_epoch=start_epoch - 1
         )
     elif config['scheduler'] == 'ReduceLROnPlateau':
         scheduler = lr_scheduler.ReduceLROnPlateau(
@@ -377,7 +398,8 @@ def main():
         scheduler = lr_scheduler.MultiStepLR(
             optimizer,
             milestones=[int(e) for e in config['milestones'].split(',')],
-            gamma=config['gamma']
+            gamma=config['gamma'],
+            last_epoch=start_epoch - 1
         )
     elif config['scheduler'] == 'ConstantLR':
         scheduler = None
@@ -450,18 +472,8 @@ def main():
         drop_last=False
     )
 
-    log = OrderedDict([
-    ('epoch', []),
-    ('lr', []),
-    ('loss', []),
-    ('iou', []),
-    ])
 
-    best_iou = 0
-    best_dice = 0
-    trigger = 0
-
-    for epoch in range(config['epochs']):
+    for epoch in range(start_epoch, config['epochs']):
         print('Epoch [%d/%d]' % (epoch, config['epochs']))
 
         # train for one epoch
@@ -487,6 +499,19 @@ def main():
 
         my_writer.add_scalar('train/loss', train_log['loss'], global_step=epoch)
         my_writer.add_scalar('train/iou', train_log['iou'], global_step=epoch)
+
+        # Save a rolling checkpoint every 5 epochs so a Colab disconnect
+        # doesn't lose all progress. Overwrites the same file each time.
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == config['epochs']:
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': config,
+                'log': log,
+            }
+            torch.save(checkpoint, f'{output_dir}/{exp_name}/checkpoint_latest.pth')
+            print(f'=> saved checkpoint at epoch {epoch+1}')
 
         torch.cuda.empty_cache()
 
