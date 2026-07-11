@@ -118,7 +118,7 @@ def parse_args():
 
     # optimizer
     parser.add_argument('--optimizer', default='Adam',
-                        choices=['Adam', 'SGD'],
+                        choices=['Adam', 'AdamW', 'SGD'],
                         help='loss: ' +
                         ' | '.join(['Adam', 'SGD']) +
                         ' (default: Adam)')
@@ -353,6 +353,8 @@ def main():
 
     if config['optimizer'] == 'Adam':
         optimizer = optim.Adam(param_groups)
+    elif config['optimizer'] == 'AdamW':
+        optimizer = optim.AdamW(param_groups)
     elif config['optimizer'] == 'SGD':
         optimizer = optim.SGD(
             param_groups,
