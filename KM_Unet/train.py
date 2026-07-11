@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 
+os.environ['ALBUMENTATIONS_DISABLE_VERSION_CHECK'] = '1'
 import albumentations as A
 from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
@@ -78,7 +79,14 @@ def parse_args():
                         help='')
     
     # model
-    parser.add_argument('--arch', '-a', metavar='ARCH', default='UKAN')
+    parser.add_argument('--arch', '-a', metavar='ARCH', default='KMPUNet')
+
+    parser.add_argument('--base_channels', default=8, type=int,
+                        help='KMPUNet stem width (paper-scale ~1M params at 8)')
+    parser.add_argument('--groups', default=4, type=int,
+                        help='KMPUNet PCMB channel groups (paper found G=4 best)')
+    parser.add_argument('--d_state', default=16, type=int,
+                        help='KMPUNet Mamba branch SSM state dimension')    
     
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
     parser.add_argument('--input_channels', default=3, type=int,
@@ -263,7 +271,7 @@ def main():
     img_ext = '.png'
     mask_ext = '.png'  # 默认值
     if dataset_name == 'busi':
-        mask_ext = '_mask.png'
+        mask_ext = '.png'
     elif dataset_name == 'glas':
         mask_ext = '.png'
     elif dataset_name == 'cvc':
@@ -315,8 +323,11 @@ def main():
         config['num_classes'],
         config['input_channels'],
         config['deep_supervision'],
-        embed_dims=config['input_list'],
-        no_kan=config['no_kan']
+        base_channels=config['base_channels'],
+        groups=config['groups'],
+        d_state=config['d_state'],
+        embed_dims=config['input_list'],   # ignored by KMPUNet, harmless to leave
+        no_kan=config['no_kan']            # ignored by KMPUNet, harmless to leave
     )
 
     model = model.to(device)
@@ -374,11 +385,11 @@ def main():
         raise NotImplementedError
 
     shutil.copy2('train.py', f'{output_dir}/{exp_name}/')
-    shutil.copy2('archs.py', f'{output_dir}/{exp_name}/')
+    shutil.copy2('src/archs.py', f'{output_dir}/{exp_name}/')
 
     # Data loading code
     img_dir = os.path.join(config['data_dir'], config['dataset'], 'images')
-    mask_dir = os.path.join(config['data_dir'], config['dataset'], 'masks', '0')
+    mask_dir = os.path.join(config['data_dir'], config['dataset'], 'masks')
 
     img_ids = sorted(glob(os.path.join(img_dir, '*' + img_ext)))
     img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
@@ -440,33 +451,30 @@ def main():
     )
 
     log = OrderedDict([
-        ('epoch', []),
-        ('lr', []),
-        ('loss', []),
-        ('iou', []),
-        ('val_loss', []),
-        ('val_iou', []),
-        ('val_dice', []),
+    ('epoch', []),
+    ('lr', []),
+    ('loss', []),
+    ('iou', []),
     ])
 
     best_iou = 0
     best_dice = 0
     trigger = 0
+
     for epoch in range(config['epochs']):
         print('Epoch [%d/%d]' % (epoch, config['epochs']))
 
         # train for one epoch
-        train_log = train(config, train_loader, model, criterion, optimizer)
-        # evaluate on validation set
-        val_log = validate(config, val_loader, model, criterion)
+        train_log = train(config, train_loader, model, criterion, optimizer, device)
 
         if config['scheduler'] == 'CosineAnnealingLR':
             scheduler.step()
-        elif config['scheduler'] == 'ReduceLROnPlateau':
-            scheduler.step(val_log['loss'])
+        elif config['scheduler'] == 'MultiStepLR':
+            scheduler.step()
+        # Note: ReduceLROnPlateau is not supported in this setup since it
+        # requires per-epoch validation loss, which we no longer compute.
 
-        print('loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f' %
-              (train_log['loss'], train_log['iou'], val_log['loss'], val_log['iou']))
+        print('loss %.4f - iou %.4f' % (train_log['loss'], train_log['iou']))
 
         # 记录当前学习率
         current_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
@@ -474,37 +482,27 @@ def main():
         log['lr'].append(current_lrs)
         log['loss'].append(train_log['loss'])
         log['iou'].append(train_log['iou'])
-        log['val_loss'].append(val_log['loss'])
-        log['val_iou'].append(val_log['iou'])
-        log['val_dice'].append(val_log['dice'])
 
         pd.DataFrame(log).to_csv(f'{output_dir}/{exp_name}/log.csv', index=False)
 
         my_writer.add_scalar('train/loss', train_log['loss'], global_step=epoch)
         my_writer.add_scalar('train/iou', train_log['iou'], global_step=epoch)
-        my_writer.add_scalar('val/loss', val_log['loss'], global_step=epoch)
-        my_writer.add_scalar('val/iou', val_log['iou'], global_step=epoch)
-        my_writer.add_scalar('val/dice', val_log['dice'], global_step=epoch)
-        my_writer.add_scalar('val/best_iou_value', best_iou, global_step=epoch)
-        my_writer.add_scalar('val/best_dice_value', best_dice, global_step=epoch)
-
-        trigger += 1
-
-        if val_log['iou'] > best_iou:
-            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
-            best_iou = val_log['iou']
-            best_dice = val_log['dice']
-            print("=> saved best model")
-            print('IoU: %.4f' % best_iou)
-            print('Dice: %.4f' % best_dice)
-            trigger = 0
-
-        # early stopping
-        if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
-            print("=> early stopping")
-            break
 
         torch.cuda.empty_cache()
-    
+
+    # evaluate on validation set once, after all training epochs
+    val_log = validate(config, val_loader, model, criterion, device)
+    print('Final val_loss %.4f - val_iou %.4f - val_dice %.4f' %
+          (val_log['loss'], val_log['iou'], val_log['dice']))
+
+    torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
+    print("=> saved final model")
+
+    my_writer.add_scalar('val/loss', val_log['loss'], global_step=config['epochs'])
+    my_writer.add_scalar('val/iou', val_log['iou'], global_step=config['epochs'])
+    my_writer.add_scalar('val/dice', val_log['dice'], global_step=config['epochs'])
+
+    my_writer.close()
+
 if __name__ == '__main__':
     main()
