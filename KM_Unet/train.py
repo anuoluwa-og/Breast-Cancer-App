@@ -5,6 +5,10 @@ from collections import OrderedDict
 from glob import glob
 import random
 import numpy as np
+import time
+
+import torch.serialization
+torch.serialization.add_safe_globals([np.core.multiarray.scalar])
 
 import pandas as pd
 import torch
@@ -171,8 +175,17 @@ def train(config, train_loader, model, criterion, optimizer, device, scaler):
 
     model.train()
 
+    data_time_total = 0.0
+    compute_time_total = 0.0
+
     pbar = tqdm(total=len(train_loader))
+    t_end = time.perf_counter()
     for input, target, _ in train_loader:
+        # time spent waiting on the DataLoader (loading + augmentation) for this batch
+        data_time_total += time.perf_counter() - t_end
+
+        t_compute_start = time.perf_counter()
+
         input = input.to(device)
         target = target.to(device)
 
@@ -201,16 +214,28 @@ def train(config, train_loader, model, criterion, optimizer, device, scaler):
         scaler.step(optimizer)
         scaler.update()
 
+        # sync so the timer reflects actual GPU compute time, not just kernel launch time
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        compute_time_total += time.perf_counter() - t_compute_start
+
         avg_meters['loss'].update(loss.item(), input.size(0))
         avg_meters['iou'].update(iou, input.size(0))
 
         postfix = OrderedDict([
             ('loss', avg_meters['loss'].avg),
             ('iou', avg_meters['iou'].avg),
+            ('data_s', round(data_time_total, 1)),
+            ('compute_s', round(compute_time_total, 1)),
         ])
         pbar.set_postfix(postfix)
         pbar.update(1)
+        t_end = time.perf_counter()
     pbar.close()
+
+    print(f"[TIMING] data-loading total: {data_time_total:.1f}s | "
+          f"compute total: {compute_time_total:.1f}s | "
+          f"data share: {100*data_time_total/(data_time_total+compute_time_total):.1f}%")
 
     return OrderedDict([('loss', avg_meters['loss'].avg),
                         ('iou', avg_meters['iou'].avg)])
