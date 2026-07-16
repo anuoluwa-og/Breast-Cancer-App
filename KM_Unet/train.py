@@ -17,6 +17,7 @@ os.environ['ALBUMENTATIONS_DISABLE_VERSION_CHECK'] = '1'
 import albumentations as A
 from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from src import archs
@@ -91,6 +92,9 @@ def parse_args():
     parser.add_argument('--resume_from', default=None, type=str,
                     help='path to checkpoint_latest.pth to resume training from')
     
+    parser.add_argument('--amp', action='store_true',
+                help='enable automatic mixed precision (fp16) training')
+    
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
     parser.add_argument('--input_channels', default=3, type=int,
                         help='input channels')
@@ -161,7 +165,7 @@ def parse_args():
 
 
 
-def train(config, train_loader, model, criterion, optimizer, device):
+def train(config, train_loader, model, criterion, optimizer, device, scaler):
     avg_meters = {'loss': AverageMeter(),
                   'iou': AverageMeter()}
 
@@ -172,27 +176,30 @@ def train(config, train_loader, model, criterion, optimizer, device):
         input = input.to(device)
         target = target.to(device)
 
-        # compute output
-        if config['deep_supervision']:
-            outputs = model(input)
-            loss = 0
-            for output in outputs:
-                loss += criterion(output, target)
-            loss /= len(outputs)
-
-            iou, dice, _ = iou_score(outputs[-1], target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
-            
-        else:
-            output = model(input)
-            loss = criterion(output, target)
-            iou, dice, _ = iou_score(output, target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
-
-        # compute gradient and do optimizing step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
+        # compute output (forward pass + loss run in mixed precision)
+        with autocast(enabled=config['amp']):
+            if config['deep_supervision']:
+                outputs = model(input)
+                loss = 0
+                for output in outputs:
+                    loss += criterion(output, target)
+                loss /= len(outputs)
+
+                iou, dice, _ = iou_score(outputs[-1], target)
+                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
+
+            else:
+                output = model(input)
+                loss = criterion(output, target)
+                iou, dice, _ = iou_score(output, target)
+                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
+
+        # compute gradient and do optimizing step (scaled for fp16 stability)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         avg_meters['loss'].update(loss.item(), input.size(0))
         avg_meters['iou'].update(iou, input.size(0))
@@ -368,6 +375,7 @@ def main():
     
     # Resume from checkpoint if provided
     start_epoch = 0
+    scaler = GradScaler(enabled=config['amp'])
     log = OrderedDict([
         ('epoch', []),
         ('lr', []),
@@ -379,6 +387,8 @@ def main():
         checkpoint = torch.load(config['resume_from'], map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint:            # ADDED - backward compatible
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         log = checkpoint.get('log', log)
         print(f"=> resuming at epoch {start_epoch}/{config['epochs']}")
@@ -479,7 +489,7 @@ def main():
         print('Epoch [%d/%d]' % (epoch, config['epochs']))
 
         # train for one epoch
-        train_log = train(config, train_loader, model, criterion, optimizer, device)
+        train_log = train(config, train_loader, model, criterion, optimizer, device, scaler)
 
         if config['scheduler'] == 'CosineAnnealingLR':
             scheduler.step()
@@ -510,6 +520,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': config,
+                'scaler_state_dict': scaler.state_dict(),
                 'log': log,
             }
             torch.save(checkpoint, f'{output_dir}/{exp_name}/checkpoint_latest.pth')
