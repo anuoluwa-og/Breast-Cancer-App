@@ -409,7 +409,7 @@ def main():
     ])
     if config['resume_from']:
         print(f"=> resuming from checkpoint: {config['resume_from']}")
-        checkpoint = torch.load(config['resume_from'], map_location=device)
+        checkpoint = torch.load(config['resume_from'], map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scaler_state_dict' in checkpoint:            # ADDED - backward compatible
