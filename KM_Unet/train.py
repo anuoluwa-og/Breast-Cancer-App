@@ -514,7 +514,7 @@ def main():
 
         # Save a rolling checkpoint every 5 epochs so a Colab disconnect
         # doesn't lose all progress. Overwrites the same file each time.
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == config['epochs']:
+        if True:
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
