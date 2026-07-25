@@ -7,6 +7,55 @@ import random
 import numpy as np
 import time
 
+def push_checkpoint_to_kaggle(checkpoint_path, dataset_slug, message):
+    """
+    Uploads the given checkpoint file as a new version of a Kaggle Dataset,
+    so training progress survives even if the notebook session dies without
+    a graceful stop. Silently no-ops (with a printed warning) if the Kaggle
+    API isn't configured or the push fails for any reason -- this must never
+    crash the training loop.
+    """
+    import os
+    import shutil
+    import subprocess
+    import json
+
+    if not (os.environ.get('KAGGLE_USERNAME') and os.environ.get('KAGGLE_KEY')):
+        print('=> [kaggle push] skipped: KAGGLE_USERNAME/KAGGLE_KEY not set')
+        return
+
+    upload_dir = '/kaggle/working/_checkpoint_push'
+    os.makedirs(upload_dir, exist_ok=True)
+    shutil.copy(checkpoint_path, os.path.join(upload_dir, 'checkpoint_latest.pth'))
+
+    metadata_path = os.path.join(upload_dir, 'dataset-metadata.json')
+    if not os.path.exists(metadata_path):
+        metadata = {
+            "title": dataset_slug.split('/')[-1],
+            "id": dataset_slug,
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
+
+    try:
+        # First push ever needs `create`; afterwards `version` updates it.
+        result = subprocess.run(
+            ['kaggle', 'datasets', 'version', '-p', upload_dir, '-m', message],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0 and 'not found' in (result.stderr or '').lower():
+            result = subprocess.run(
+                ['kaggle', 'datasets', 'create', '-p', upload_dir],
+                capture_output=True, text=True, timeout=180,
+            )
+        if result.returncode == 0:
+            print(f'=> [kaggle push] checkpoint uploaded ({message})')
+        else:
+            print(f'=> [kaggle push] failed: {result.stderr.strip()[:300]}')
+    except Exception as e:
+        print(f'=> [kaggle push] failed with exception: {e}')
+
 import torch.serialization
 torch.serialization.add_safe_globals([np.core.multiarray.scalar])
 
@@ -98,6 +147,11 @@ def parse_args():
     
     parser.add_argument('--amp', action='store_true',
                 help='enable automatic mixed precision (fp16) training')
+
+    parser.add_argument('--kaggle_push_every', default=0, type=int,
+                help='push checkpoint to a Kaggle Dataset every N epochs (0 = disabled)')
+    parser.add_argument('--kaggle_dataset_slug', default=None, type=str,
+                help="Kaggle dataset slug to push to, e.g. 'yourusername/kmpunet-checkpoint'")
     
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
     parser.add_argument('--input_channels', default=3, type=int,
@@ -550,6 +604,14 @@ def main():
             }
             torch.save(checkpoint, f'{output_dir}/{exp_name}/checkpoint_latest.pth')
             print(f'=> saved checkpoint at epoch {epoch+1}')
+
+            if config['kaggle_push_every'] and config['kaggle_dataset_slug'] \
+                    and (epoch + 1) % config['kaggle_push_every'] == 0:
+                push_checkpoint_to_kaggle(
+                    f'{output_dir}/{exp_name}/checkpoint_latest.pth',
+                    config['kaggle_dataset_slug'],
+                    message=f'epoch {epoch+1}',
+                )
 
         torch.cuda.empty_cache()
 
