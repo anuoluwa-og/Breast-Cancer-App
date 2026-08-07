@@ -57,6 +57,7 @@ class Dataset(torch.utils.data.Dataset):
 
         # 读取图像
         img = cv2.imread(os.path.join(self.img_dir, img_id + self.img_ext))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # 读取掩码
         mask = []
@@ -72,7 +73,7 @@ class Dataset(torch.utils.data.Dataset):
             mask = augmented['mask']
 
         # 归一化图像
-        img = img.astype('float32') / 255
+        img = img.astype('float32')
         img = img.transpose(2, 0, 1)  # 将 HWC 转为 CHW
 
         # 归一化掩码
