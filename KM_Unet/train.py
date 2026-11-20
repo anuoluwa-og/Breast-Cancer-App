@@ -102,6 +102,41 @@ except ImportError:
 LOSS_NAMES = list(losses.__all__) + ['BCEWithLogitsLoss']
 
 
+class _NoWandb:
+    """No-op stand-in used when --wandb is off or W&B fails, so the loop never branches on it."""
+
+    def __init__(self):
+        self.summary = {}
+
+    def log(self, *args, **kwargs):
+        pass
+
+    def finish(self, *args, **kwargs):
+        pass
+
+
+def init_wandb(config, run_dir):
+    """Start a W&B run (or return a no-op). Never lets a W&B problem crash training.
+
+    The run id is the run name, so --resume_from after a Kaggle cut-off continues the same W&B run.
+    Metrics are plotted against 'epoch' so a resumed run cannot hit W&B's monotonic-step rule.
+    """
+    if not config['wandb']:
+        return _NoWandb()
+    try:
+        import wandb
+        run = wandb.init(project=config['wandb_project'], entity=config['wandb_entity'],
+                         name=config['name'], id=config['name'], resume='allow',
+                         group=config['wandb_group'], tags=[config['aug'], config['dataset']],
+                         config=config, dir=run_dir)
+        wandb.define_metric('epoch')
+        wandb.define_metric('*', step_metric='epoch')
+        return run
+    except Exception as e:
+        print(f'=> [wandb] disabled: {e}')
+        return _NoWandb()
+
+
 def list_type(s):
     return [int(a) for a in s.split(',')] if s else []
 
@@ -173,6 +208,12 @@ def parse_args():
                              'final training size is reached). -1 = off.')
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--no_kan', action='store_true')
+
+    # Weights & Biases logging (off by default; needs `pip install wandb` and `wandb login` / WANDB_API_KEY)
+    parser.add_argument('--wandb', action='store_true', help='log metrics to Weights & Biases')
+    parser.add_argument('--wandb_project', default='kmpunet-busi', type=str)
+    parser.add_argument('--wandb_entity', default=None, type=str, help='W&B user/team (default: your account)')
+    parser.add_argument('--wandb_group', default='busi-aug-ablation', type=str)
 
     return parser.parse_args()
 
@@ -281,6 +322,7 @@ def main():
     print('-' * 20)
     with open(f'{run_dir}/config.yml', 'w') as f:
         yaml.dump(config, f)
+    wb = init_wandb(config, run_dir)
 
     cudnn.benchmark = True
     print(f'Using device: {device}')
@@ -404,6 +446,9 @@ def main():
             my_writer.add_scalar('train/' + k, train_log[k], global_step=epoch)
         for k in ['loss', 'dice', 'iou']:
             my_writer.add_scalar('val/' + k, val_log[k], global_step=epoch)
+        wb.log({'epoch': epoch, 'train_size': size, 'lr': log['lr'][-1], 'best_val_dice': best_dice,
+                **{'train/' + k: v for k, v in train_log.items()},
+                **{'val/' + k: v for k, v in val_log.items()}})
 
         torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(), 'config': config,
@@ -428,6 +473,8 @@ def main():
     print('Best-val checkpoint (epoch %d): val dice %.4f +- %.4f  iou %.4f' %
           (best_epoch, final_val['dice'], final_val['dice_std'], final_val['iou']))
     my_writer.close()
+    wb.summary.update({'final/' + k: v for k, v in final_val.items()})
+    wb.finish()
 
 
 if __name__ == '__main__':
