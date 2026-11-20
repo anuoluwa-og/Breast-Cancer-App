@@ -137,6 +137,36 @@ def init_wandb(config, run_dir):
         return _NoWandb()
 
 
+class _NoTracker:
+    """No-op stand-in used when --trackio is off or Trackio fails."""
+
+    def log(self, *args, **kwargs):
+        pass
+
+    def finish(self, *args, **kwargs):
+        pass
+
+
+def init_trackio(config):
+    """Start a Trackio run (or return a no-op). Never lets a tracker problem crash training.
+
+    Local-first, no account needed: metrics go to <output_dir>/trackio (override with the TRACKIO_DIR
+    env var) so every run shares one store. View with `trackio show --project <name>`.
+    Runs are keyed by run name with resume='allow', so --resume_from continues the same Trackio run.
+    """
+    if not config['trackio']:
+        return _NoTracker()
+    try:
+        os.environ.setdefault('TRACKIO_DIR', os.path.abspath(os.path.join(config['output_dir'], 'trackio')))
+        import trackio
+        trackio.init(project=config['trackio_project'], name=config['name'], group=config['trackio_group'],
+                     config=config, resume='allow')
+        return trackio
+    except Exception as e:
+        print(f'=> [trackio] disabled: {e}')
+        return _NoTracker()
+
+
 def list_type(s):
     return [int(a) for a in s.split(',')] if s else []
 
@@ -214,6 +244,11 @@ def parse_args():
     parser.add_argument('--wandb_project', default='kmpunet-busi', type=str)
     parser.add_argument('--wandb_entity', default=None, type=str, help='W&B user/team (default: your account)')
     parser.add_argument('--wandb_group', default='busi-aug-ablation', type=str)
+
+    # Trackio logging (off by default; local dashboard, no account; needs `pip install trackio`)
+    parser.add_argument('--trackio', action='store_true', help='log metrics to Trackio')
+    parser.add_argument('--trackio_project', default='kmpunet-busi', type=str)
+    parser.add_argument('--trackio_group', default='busi-aug-ablation', type=str)
 
     return parser.parse_args()
 
@@ -323,6 +358,7 @@ def main():
     with open(f'{run_dir}/config.yml', 'w') as f:
         yaml.dump(config, f)
     wb = init_wandb(config, run_dir)
+    tk = init_trackio(config)
 
     cudnn.benchmark = True
     print(f'Using device: {device}')
@@ -446,9 +482,11 @@ def main():
             my_writer.add_scalar('train/' + k, train_log[k], global_step=epoch)
         for k in ['loss', 'dice', 'iou']:
             my_writer.add_scalar('val/' + k, val_log[k], global_step=epoch)
-        wb.log({'epoch': epoch, 'train_size': size, 'lr': log['lr'][-1], 'best_val_dice': best_dice,
-                **{'train/' + k: v for k, v in train_log.items()},
-                **{'val/' + k: v for k, v in val_log.items()}})
+        metrics = {'epoch': epoch, 'train_size': size, 'lr': log['lr'][-1], 'best_val_dice': best_dice,
+                   **{'train/' + k: v for k, v in train_log.items()},
+                   **{'val/' + k: v for k, v in val_log.items()}}
+        wb.log(metrics)
+        tk.log(metrics, step=epoch)
 
         torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(), 'config': config,
@@ -475,6 +513,7 @@ def main():
     my_writer.close()
     wb.summary.update({'final/' + k: v for k, v in final_val.items()})
     wb.finish()
+    tk.finish()
 
 
 if __name__ == '__main__':
