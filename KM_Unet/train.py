@@ -5,6 +5,59 @@ from collections import OrderedDict
 from glob import glob
 import random
 import numpy as np
+import time
+
+def push_checkpoint_to_kaggle(checkpoint_path, dataset_slug, message):
+    """
+    Uploads the given checkpoint file as a new version of a Kaggle Dataset,
+    so training progress survives even if the notebook session dies without
+    a graceful stop. Silently no-ops (with a printed warning) if the Kaggle
+    API isn't configured or the push fails for any reason -- this must never
+    crash the training loop.
+    """
+    import os
+    import shutil
+    import subprocess
+    import json
+
+    if not (os.environ.get('KAGGLE_USERNAME') and os.environ.get('KAGGLE_KEY')):
+        print('=> [kaggle push] skipped: KAGGLE_USERNAME/KAGGLE_KEY not set')
+        return
+
+    upload_dir = '/kaggle/working/_checkpoint_push'
+    os.makedirs(upload_dir, exist_ok=True)
+    shutil.copy(checkpoint_path, os.path.join(upload_dir, 'checkpoint_latest.pth'))
+
+    metadata_path = os.path.join(upload_dir, 'dataset-metadata.json')
+    if not os.path.exists(metadata_path):
+        metadata = {
+            "title": dataset_slug.split('/')[-1],
+            "id": dataset_slug,
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
+
+    try:
+        # First push ever needs `create`; afterwards `version` updates it.
+        result = subprocess.run(
+            ['kaggle', 'datasets', 'version', '-p', upload_dir, '-m', message],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0 and 'not found' in (result.stderr or '').lower():
+            result = subprocess.run(
+                ['kaggle', 'datasets', 'create', '-p', upload_dir],
+                capture_output=True, text=True, timeout=180,
+            )
+        if result.returncode == 0:
+            print(f'=> [kaggle push] checkpoint uploaded ({message})')
+        else:
+            print(f'=> [kaggle push] failed: {result.stderr.strip()[:300]}')
+    except Exception as e:
+        print(f'=> [kaggle push] failed with exception: {e}')
+
+import torch.serialization
+torch.serialization.add_safe_globals([np.core.multiarray.scalar])
 
 import pandas as pd
 import torch
@@ -17,6 +70,7 @@ os.environ['ALBUMENTATIONS_DISABLE_VERSION_CHECK'] = '1'
 import albumentations as A
 from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from src import archs
@@ -60,9 +114,7 @@ LOSS_NAMES.append('BCEWithLogitsLoss')
 
 
 def list_type(s):
-    str_list = s.split(',')
-    int_list = [int(a) for a in str_list]
-    return int_list
+    return [int(a) for a in s.split(',')] if s else []
 
 
 def parse_args():
@@ -91,6 +143,14 @@ def parse_args():
     parser.add_argument('--resume_from', default=None, type=str,
                     help='path to checkpoint_latest.pth to resume training from')
     
+    parser.add_argument('--amp', action='store_true',
+                help='enable automatic mixed precision (fp16) training')
+
+    parser.add_argument('--kaggle_push_every', default=0, type=int,
+                help='push checkpoint to a Kaggle Dataset every N epochs (0 = disabled)')
+    parser.add_argument('--kaggle_dataset_slug', default=None, type=str,
+                help="Kaggle dataset slug to push to, e.g. 'yourusername/kmpunet-checkpoint'")
+    
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
     parser.add_argument('--input_channels', default=3, type=int,
                         help='input channels')
@@ -101,6 +161,11 @@ def parse_args():
     parser.add_argument('--input_h', default=256, type=int,
                         help='image height')
     parser.add_argument('--input_list', type=list_type, default=[128, 160, 256])
+    parser.add_argument('--prog_sizes', type=list_type, default=[],
+                        help='progressive resizing, e.g. 128,224,256: the training image size steps '
+                             'through this list in equal fractions of --epochs. The last entry must '
+                             'equal --input_h and --input_w. Validation always uses input_h x input_w. '
+                             'Empty (default) = fixed input size.')
 
     # loss
     parser.add_argument('--loss', default='BCEDiceLoss',
@@ -161,38 +226,55 @@ def parse_args():
 
 
 
-def train(config, train_loader, model, criterion, optimizer, device):
+def train(config, train_loader, model, criterion, optimizer, device, scaler):
     avg_meters = {'loss': AverageMeter(),
                   'iou': AverageMeter()}
 
     model.train()
 
+    data_time_total = 0.0
+    compute_time_total = 0.0
+
     pbar = tqdm(total=len(train_loader))
+    t_end = time.perf_counter()
     for input, target, _ in train_loader:
+        # time spent waiting on the DataLoader (loading + augmentation) for this batch
+        data_time_total += time.perf_counter() - t_end
+
+        t_compute_start = time.perf_counter()
+
         input = input.to(device)
         target = target.to(device)
 
-        # compute output
-        if config['deep_supervision']:
-            outputs = model(input)
-            loss = 0
-            for output in outputs:
-                loss += criterion(output, target)
-            loss /= len(outputs)
-
-            iou, dice, _ = iou_score(outputs[-1], target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
-            
-        else:
-            output = model(input)
-            loss = criterion(output, target)
-            iou, dice, _ = iou_score(output, target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
-
-        # compute gradient and do optimizing step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
+        # compute output (forward pass + loss run in mixed precision)
+        with autocast(enabled=config['amp']):
+            if config['deep_supervision']:
+                outputs = model(input)
+                loss = 0
+                for output in outputs:
+                    loss += criterion(output, target)
+                loss /= len(outputs)
+
+                iou, dice, _ = iou_score(outputs[-1], target)
+                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
+
+            else:
+                output = model(input)
+                loss = criterion(output, target)
+                iou, dice, _ = iou_score(output, target)
+                iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
+
+        # compute gradient and do optimizing step (scaled for fp16 stability)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # sync so the timer reflects actual GPU compute time, not just kernel launch time
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        compute_time_total += time.perf_counter() - t_compute_start
 
         avg_meters['loss'].update(loss.item(), input.size(0))
         avg_meters['iou'].update(iou, input.size(0))
@@ -200,10 +282,17 @@ def train(config, train_loader, model, criterion, optimizer, device):
         postfix = OrderedDict([
             ('loss', avg_meters['loss'].avg),
             ('iou', avg_meters['iou'].avg),
+            ('data_s', round(data_time_total, 1)),
+            ('compute_s', round(compute_time_total, 1)),
         ])
         pbar.set_postfix(postfix)
         pbar.update(1)
+        t_end = time.perf_counter()
     pbar.close()
+
+    print(f"[TIMING] data-loading total: {data_time_total:.1f}s | "
+          f"compute total: {compute_time_total:.1f}s | "
+          f"data share: {100*data_time_total/(data_time_total+compute_time_total):.1f}%")
 
     return OrderedDict([('loss', avg_meters['loss'].avg),
                         ('iou', avg_meters['iou'].avg)])
@@ -263,6 +352,29 @@ def seed_torch(seed=1029):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+
+def size_schedule(config):
+    """Training image sizes for progressive resizing. Falls back to the fixed input size."""
+    sizes = config['prog_sizes'] or [config['input_h']]
+    if sizes[-1] != config['input_h'] or config['input_h'] != config['input_w']:
+        raise ValueError(f"last --prog_sizes entry ({sizes[-1]}) must equal --input_h "
+                         f"({config['input_h']}) and --input_w ({config['input_w']})")
+    return sizes
+
+
+def size_for_epoch(sizes, epoch, total_epochs):
+    """Step through `sizes` in equal fractions of the total epochs (e.g. 300 epochs, 3 sizes -> 100 each)."""
+    return sizes[min(int(epoch / total_epochs * len(sizes)), len(sizes) - 1)]
+
+
+def build_train_transform(height, width):
+    return A.Compose([
+        A.RandomRotate90(),
+        A.HorizontalFlip(),
+        A.Resize(height, width),
+        A.Normalize(),
+    ])
 
 
 def main():
@@ -368,19 +480,25 @@ def main():
     
     # Resume from checkpoint if provided
     start_epoch = 0
+    scaler = GradScaler(enabled=config['amp'])
     log = OrderedDict([
         ('epoch', []),
+        ('size', []),
         ('lr', []),
         ('loss', []),
         ('iou', []),
     ])
     if config['resume_from']:
         print(f"=> resuming from checkpoint: {config['resume_from']}")
-        checkpoint = torch.load(config['resume_from'], map_location=device)
+        checkpoint = torch.load(config['resume_from'], map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint:            # ADDED - backward compatible
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         log = checkpoint.get('log', log)
+        # checkpoints from before progressive resizing have no 'size' column
+        log.setdefault('size', [None] * len(log['epoch']))
         print(f"=> resuming at epoch {start_epoch}/{config['epochs']}")
 
     if config['scheduler'] == 'CosineAnnealingLR':
@@ -426,12 +544,15 @@ def main():
         random_state=config['dataseed']
     )
 
-    train_transform = A.Compose([
-        A.RandomRotate90(),
-        A.HorizontalFlip(),
-        A.Resize(config['input_h'], config['input_w']),
-        A.Normalize(),
-    ])
+    # Progressive resizing: the training transform is rebuilt at the start of every epoch with the
+    # size for that epoch. Validation is always done at the final input size.
+    progressive = bool(config['prog_sizes'])
+    sizes = size_schedule(config)
+
+    if progressive:
+        train_transform = build_train_transform(sizes[0], sizes[0])
+    else:
+        train_transform = build_train_transform(config['input_h'], config['input_w'])
 
     val_transform = A.Compose([
         A.Resize(config['input_h'], config['input_w']),
@@ -476,10 +597,17 @@ def main():
 
 
     for epoch in range(start_epoch, config['epochs']):
-        print('Epoch [%d/%d]' % (epoch, config['epochs']))
+        if progressive:
+            size = size_for_epoch(sizes, epoch, config['epochs'])
+            # DataLoader workers are re-created every epoch (persistent_workers is off),
+            # so the new transform is picked up.
+            train_dataset.transform = build_train_transform(size, size)
+        else:
+            size = config['input_h']
+        print('Epoch [%d/%d]  train size %dx%d' % (epoch, config['epochs'], size, size))
 
         # train for one epoch
-        train_log = train(config, train_loader, model, criterion, optimizer, device)
+        train_log = train(config, train_loader, model, criterion, optimizer, device, scaler)
 
         if config['scheduler'] == 'CosineAnnealingLR':
             scheduler.step()
@@ -493,6 +621,7 @@ def main():
         # 记录当前学习率
         current_lrs = [param_group['lr'] for param_group in optimizer.param_groups]
         log['epoch'].append(epoch)
+        log['size'].append(size)
         log['lr'].append(current_lrs)
         log['loss'].append(train_log['loss'])
         log['iou'].append(train_log['iou'])
@@ -502,18 +631,27 @@ def main():
         my_writer.add_scalar('train/loss', train_log['loss'], global_step=epoch)
         my_writer.add_scalar('train/iou', train_log['iou'], global_step=epoch)
 
-        # Save a rolling checkpoint every 5 epochs so a Colab disconnect
+        # Save a rolling checkpoint every epoch so a Colab/Kaggle disconnect
         # doesn't lose all progress. Overwrites the same file each time.
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == config['epochs']:
+        if True:
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': config,
+                'scaler_state_dict': scaler.state_dict(),
                 'log': log,
             }
             torch.save(checkpoint, f'{output_dir}/{exp_name}/checkpoint_latest.pth')
             print(f'=> saved checkpoint at epoch {epoch+1}')
+
+            if config['kaggle_push_every'] and config['kaggle_dataset_slug'] \
+                    and (epoch + 1) % config['kaggle_push_every'] == 0:
+                push_checkpoint_to_kaggle(
+                    f'{output_dir}/{exp_name}/checkpoint_latest.pth',
+                    config['kaggle_dataset_slug'],
+                    message=f'epoch {epoch+1}',
+                )
 
         torch.cuda.empty_cache()
 
