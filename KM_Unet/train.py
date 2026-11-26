@@ -167,6 +167,26 @@ def init_trackio(config):
         return _NoTracker()
 
 
+def replay_to_trackio(log, tk):
+    """Re-log earlier epochs (from the checkpoint's log) into Trackio.
+
+    A resumed run in a fresh Kaggle session starts with an empty Trackio store, so without this the
+    final Trackio run would only contain the epochs after the resume point. Only the metrics that
+    are kept in the checkpoint log are replayed (no dice_std / iou_std). Never crashes training.
+    """
+    try:
+        best = -1.0
+        for i, ep in enumerate(log['epoch']):
+            best = max(best, log['val_dice'][i])
+            tk.log({'epoch': ep, 'train_size': log['size'][i], 'lr': log['lr'][i], 'best_val_dice': best,
+                    'train/loss': log['loss'][i], 'train/dice': log['dice'][i], 'train/iou': log['iou'][i],
+                    'val/loss': log['val_loss'][i], 'val/dice': log['val_dice'][i],
+                    'val/iou': log['val_iou'][i]}, step=ep)
+        print(f"=> [trackio] replayed {len(log['epoch'])} earlier epochs from the checkpoint log")
+    except Exception as e:
+        print(f'=> [trackio] replay skipped: {e}')
+
+
 def list_type(s):
     return [int(a) for a in s.split(',')] if s else []
 
@@ -405,6 +425,7 @@ def main():
     log = OrderedDict([(k, []) for k in ['epoch', 'size', 'lr', 'loss', 'dice', 'iou',
                                          'val_loss', 'val_dice', 'val_iou']])
     best_dice, best_epoch, bad_epochs = -1.0, -1, 0
+    best_state = None  # CPU copy of the best weights; stored in checkpoint_latest.pth so it survives a cut-off
     if config['resume_from']:
         print(f"=> resuming from checkpoint: {config['resume_from']}")
         ckpt = torch.load(config['resume_from'], map_location=device, weights_only=False)
@@ -419,6 +440,23 @@ def main():
         bad_epochs = ckpt.get('bad_epochs', bad_epochs)
         # restore RNG so a resumed run continues the same stream where possible
         print(f"=> resuming at epoch {start_epoch}/{config['epochs']} (best val dice so far {best_dice:.4f})")
+
+        # A new Kaggle session starts with an empty run dir: bring the best weights back from the checkpoint.
+        best_path = f'{run_dir}/model_best.pth'
+        best_state = ckpt.get('best_state_dict')
+        if not os.path.exists(best_path):
+            if best_state is not None:
+                torch.save(best_state, best_path)
+                print(f'=> restored model_best.pth from the checkpoint (best val dice {best_dice:.4f}, '
+                      f'epoch {best_epoch})')
+            else:
+                print('WARNING: this checkpoint has no copy of the best weights (made before this fix), so the '
+                      'best-so-far weights are lost. Best val dice is re-tracked from this session on.')
+                best_dice, best_epoch = -1.0, -1
+
+        # Fresh working dir (no log.csv yet) = the Trackio store is empty too: re-log the earlier epochs.
+        if not os.path.exists(f'{run_dir}/log.csv'):
+            replay_to_trackio(log, tk)
 
     if config['scheduler'] == 'CosineAnnealingLR':
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'],
@@ -478,7 +516,8 @@ def main():
 
         if val_log['dice'] > best_dice:
             best_dice, best_epoch, bad_epochs = val_log['dice'], epoch, 0
-            torch.save(model.state_dict(), f'{run_dir}/model_best.pth')
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            torch.save(best_state, f'{run_dir}/model_best.pth')
             print(f'=> new best val dice {best_dice:.4f} (epoch {epoch}), saved model_best.pth')
         elif epoch >= final_stage_start:
             bad_epochs += 1
@@ -501,7 +540,8 @@ def main():
         torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(), 'config': config,
                     'scaler_state_dict': scaler.state_dict(), 'log': dict(log),
-                    'best_dice': best_dice, 'best_epoch': best_epoch, 'bad_epochs': bad_epochs},
+                    'best_dice': best_dice, 'best_epoch': best_epoch, 'bad_epochs': bad_epochs,
+                    'best_state_dict': best_state},
                    f'{run_dir}/checkpoint_latest.pth')
         if config['kaggle_push_every'] and config['kaggle_dataset_slug'] and (epoch + 1) % config['kaggle_push_every'] == 0:
             push_checkpoint_to_kaggle(f'{run_dir}/checkpoint_latest.pth', config['kaggle_dataset_slug'],
@@ -514,7 +554,11 @@ def main():
 
     # final model = best-val-Dice checkpoint; also keep the last-epoch weights
     torch.save(model.state_dict(), f'{run_dir}/model_last.pth')
-    model.load_state_dict(torch.load(f'{run_dir}/model_best.pth', map_location=device))
+    best_path = f'{run_dir}/model_best.pth'
+    if os.path.exists(best_path):
+        model.load_state_dict(torch.load(best_path, map_location=device))
+    else:
+        print('WARNING: model_best.pth is missing; reporting the last-epoch weights instead')
     final_val = validate(config, val_loader, model, criterion, device)
     final_val.update(best_epoch=best_epoch, epochs_run=len(log['epoch']))
     json.dump(final_val, open(f'{run_dir}/final_val.json', 'w'), indent=1)
