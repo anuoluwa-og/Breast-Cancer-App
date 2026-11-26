@@ -187,9 +187,6 @@ def parse_args():
     parser.add_argument('--d_state', default=16, type=int)
 
     parser.add_argument('--resume_from', default=None, type=str, help='path to checkpoint_latest.pth')
-    parser.add_argument('--pretrained', default=None, type=str,
-                        help='model_best.pth to initialise from (fine-tuning); weights only, '
-                             'optimizer/scheduler/epoch start fresh. Ignored if --resume_from is given.')
     parser.add_argument('--amp', action='store_true', help='mixed precision (fp16)')
     parser.add_argument('--kaggle_push_every', default=0, type=int)
     parser.add_argument('--kaggle_dataset_slug', default=None, type=str)
@@ -377,13 +374,6 @@ def main():
         embed_dims=config['input_list'], no_kan=config['no_kan'],
     ).to(device)
     print('params: %.3fM' % (sum(p.numel() for p in model.parameters()) / 1e6))
-
-    # Fine-tuning init: weights only (optimizer, scheduler and epoch counter start fresh).
-    # --resume_from, if given, restores the full checkpoint afterwards and takes precedence.
-    if config['pretrained']:
-        state = torch.load(config['pretrained'], map_location=device, weights_only=True)
-        print('=> loaded pretrained weights from %s: %s' %
-              (config['pretrained'], model.load_state_dict(state, strict=True)))
 
     param_groups = []
     for name, param in model.named_parameters():
